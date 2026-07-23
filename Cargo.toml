@@ -2,3 +2,13 @@
 name = "compare-svg"
 version = "0.1.0"
 edition = "2024"
+description = "Compare an SVG in the working tree with its version at Git HEAD"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.6", features = ["derive"] }
+gix = { version = "0.86", default-features = false, features = ["sha1"] }
+open = "5.3"
+tempdir = "0.3"
