@@ -28,7 +28,7 @@ struct Cli {
 #[derive(Debug)]
 struct SnapshotVersions {
     repository_relative_path: PathBuf,
-    previous: Vec<u8>,
+    previous: Option<Vec<u8>>,
     current: Vec<u8>,
 }
 
@@ -129,29 +129,29 @@ fn load_versions(input_paths: &[PathBuf]) -> Result<Vec<SnapshotVersions>> {
                         "failed to look up '{}' in the tree at HEAD",
                         repository_relative_path.display()
                     )
-                })?
-                .with_context(|| {
-                    format!(
-                        "'{}' does not have a previous version at HEAD",
-                        repository_relative_path.display()
-                    )
                 })?;
-            let object = entry.object().with_context(|| {
-                format!(
-                    "failed to load '{}' from HEAD",
-                    repository_relative_path.display()
-                )
-            })?;
-            let blob = object.try_into_blob().with_context(|| {
-                format!(
-                    "'{}' is not a file at HEAD",
-                    repository_relative_path.display()
-                )
-            })?;
+            let previous = match entry {
+                Some(entry) => {
+                    let object = entry.object().with_context(|| {
+                        format!(
+                            "failed to load '{}' from HEAD",
+                            repository_relative_path.display()
+                        )
+                    })?;
+                    let blob = object.try_into_blob().with_context(|| {
+                        format!(
+                            "'{}' is not a file at HEAD",
+                            repository_relative_path.display()
+                        )
+                    })?;
+                    Some(blob.data.clone())
+                }
+                None => None,
+            };
 
             Ok(SnapshotVersions {
                 repository_relative_path,
-                previous: blob.data.clone(),
+                previous,
                 current,
             })
         })
@@ -195,6 +195,8 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
         return String::new();
     };
     let first_path = escape_html(&first.repository_relative_path.to_string_lossy());
+    let first_has_previous = first.previous.is_some();
+    let mode_switcher_hidden = if first_has_previous { "" } else { " hidden" };
     let file_count = versions.len();
     let file_count_label = if file_count == 1 { "file" } else { "files" };
     let mut file_buttons = String::new();
@@ -208,6 +210,10 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
             .unwrap_or(versions.repository_relative_path.as_os_str());
         let file_name = escape_html(&file_name.to_string_lossy());
         let is_selected = index == 0;
+        let (has_previous, previous) = match &versions.previous {
+            Some(previous) => (true, STANDARD.encode(previous)),
+            None => (false, String::new()),
+        };
         write!(
             file_buttons,
             r#"<button class="file-button" type="button" data-file-index="{index}" aria-current="{is_selected}">{file_name}</button>"#
@@ -215,8 +221,7 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
         .expect("writing HTML to a string cannot fail");
         write!(
             file_data,
-            r#"<div data-file data-path="{path}" data-previous="{}" data-current="{}"></div>"#,
-            STANDARD.encode(&versions.previous),
+            r#"<div data-file data-path="{path}" data-has-previous="{has_previous}" data-previous="{previous}" data-current="{}"></div>"#,
             STANDARD.encode(&versions.current)
         )
         .expect("writing HTML to a string cannot fail");
@@ -431,6 +436,16 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
     .comparison[data-mode="swipe"] .overlay-panel {{
       display: block;
     }}
+    .comparison[data-has-previous="false"] {{
+      grid-template-columns: minmax(0, 1fr);
+    }}
+    .comparison[data-has-previous="false"] .previous-panel,
+    .comparison[data-has-previous="false"] .overlay-panel {{
+      display: none;
+    }}
+    .comparison[data-has-previous="false"] .current-panel {{
+      display: block;
+    }}
     .overlay-viewport {{ padding: 1rem; }}
     .image-stack {{
       position: relative;
@@ -538,7 +553,7 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
         <div class="path" id="selected-path">{first_path}</div>
         <div class="toolbar">
           <button class="sidebar-toggle" id="sidebar-toggle" type="button" aria-controls="file-sidebar" aria-expanded="true">Hide files</button>
-          <div class="mode-switcher" role="group" aria-label="Comparison mode">
+          <div class="mode-switcher" id="mode-switcher" role="group" aria-label="Comparison mode"{mode_switcher_hidden}>
             <button class="mode-button" type="button" data-mode-button="side-by-side" aria-pressed="true">Side by side</button>
             <button class="mode-button" type="button" data-mode-button="onion" aria-pressed="false">Onion skin</button>
             <button class="mode-button" type="button" data-mode-button="swipe" aria-pressed="false">Swipe</button>
@@ -555,14 +570,14 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
           </div>
         </div>
       </header>
-      <main class="comparison" id="comparison" data-mode="side-by-side">
-        <section class="side-by-side-panel">
+      <main class="comparison" id="comparison" data-mode="side-by-side" data-has-previous="{first_has_previous}">
+        <section class="side-by-side-panel previous-panel">
           <h2>Previous (HEAD)</h2>
           <div class="viewport">
             <img id="previous-image" alt="Previous SVG at HEAD" draggable="false">
           </div>
         </section>
-        <section class="side-by-side-panel">
+        <section class="side-by-side-panel current-panel">
           <h2>Current (working tree)</h2>
           <div class="viewport">
             <img id="current-image" alt="Current SVG in the working tree" draggable="false">
@@ -590,6 +605,7 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
       const appShell = document.getElementById("app-shell");
       const sidebarToggle = document.getElementById("sidebar-toggle");
       const comparison = document.getElementById("comparison");
+      const modeSwitcher = document.getElementById("mode-switcher");
       const modeButtons = Array.from(document.querySelectorAll("[data-mode-button]"));
       const onionControl = document.getElementById("onion-control");
       const onionRange = document.getElementById("onion-opacity");
@@ -620,23 +636,38 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
         sidebarToggle.textContent = isVisible ? "Hide files" : "Show files";
       }};
 
+      const updateModeControls = () => {{
+        const hasPrevious = comparison.dataset.hasPrevious === "true";
+        const mode = comparison.dataset.mode;
+        modeSwitcher.hidden = !hasPrevious;
+        onionControl.hidden = !hasPrevious || mode !== "onion";
+        swipeControl.hidden = !hasPrevious || mode !== "swipe";
+      }};
+
       const setFile = (index) => {{
         const file = files[index];
         const path = file.dataset.path;
-        const previousSource = "data:image/svg+xml;base64," + file.dataset.previous;
+        const hasPrevious = file.dataset.hasPrevious === "true";
         const currentSource = "data:image/svg+xml;base64," + file.dataset.current;
 
         fileButtons.forEach((button, buttonIndex) => {{
           button.setAttribute("aria-current", String(buttonIndex === index));
         }});
         previousImages.forEach((image) => {{
-          image.src = previousSource;
-          image.alt = "Previous version of " + path + " at HEAD";
+          if (hasPrevious) {{
+            image.src = "data:image/svg+xml;base64," + file.dataset.previous;
+            image.alt = "Previous version of " + path + " at HEAD";
+          }} else {{
+            image.removeAttribute("src");
+            image.alt = "";
+          }}
         }});
         currentImages.forEach((image) => {{
           image.src = currentSource;
           image.alt = "Current working-tree version of " + path;
         }});
+        comparison.dataset.hasPrevious = String(hasPrevious);
+        updateModeControls();
         selectedPath.textContent = path;
         document.title = "SVG comparison — " + path;
         viewports.forEach((viewport) => viewport.scrollTo(0, 0));
@@ -659,8 +690,7 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
         modeButtons.forEach((button) => {{
           button.setAttribute("aria-pressed", String(button.dataset.modeButton === mode));
         }});
-        onionControl.hidden = mode !== "onion";
-        swipeControl.hidden = mode !== "swipe";
+        updateModeControls();
         overlayTitle.textContent = mode === "onion" ? "Onion skin" : "Swipe";
       }};
 
@@ -800,12 +830,12 @@ mod tests {
         let versions = [
             SnapshotVersions {
                 repository_relative_path: PathBuf::from("snapshots/<example>&.svg"),
-                previous: b"previous".to_vec(),
+                previous: Some(b"previous".to_vec()),
                 current: b"current".to_vec(),
             },
             SnapshotVersions {
                 repository_relative_path: PathBuf::from("icons/other.svg"),
-                previous: b"other previous".to_vec(),
+                previous: None,
                 current: b"other current".to_vec(),
             },
         ];
@@ -829,6 +859,12 @@ mod tests {
         assert!(html.contains("data-mode-button=\"swipe\""));
         assert!(html.contains("id=\"onion-opacity\""));
         assert!(html.contains("id=\"swipe-position\""));
+        assert!(html.contains("data-has-previous=\"true\" data-previous="));
+        assert!(html.contains(
+            "data-path=\"icons/other.svg\" data-has-previous=\"false\" data-previous=\"\""
+        ));
+        assert!(html.contains(".comparison[data-has-previous=\"false\"]"));
+        assert!(html.contains("modeSwitcher.hidden = !hasPrevious"));
         assert!(html.contains(
             "id=\"sidebar-toggle\" type=\"button\" aria-controls=\"file-sidebar\" aria-expanded=\"true\">Hide files</button>"
         ));
@@ -850,14 +886,6 @@ mod tests {
         );
         assert_eq!(
             html.matches(&format!(
-                "data-previous=\"{}\"",
-                STANDARD.encode(b"other previous")
-            ))
-            .count(),
-            1
-        );
-        assert_eq!(
-            html.matches(&format!(
                 "data-current=\"{}\"",
                 STANDARD.encode(b"other current")
             ))
@@ -867,6 +895,39 @@ mod tests {
         assert_eq!(html.matches("draggable=\"false\"").count(), 4);
         assert!(html.contains("pointer-events: none"));
         assert!(!html.contains("<example>"));
+    }
+
+    #[test]
+    fn renders_an_untracked_initial_file_as_current_only() {
+        let versions = [SnapshotVersions {
+            repository_relative_path: PathBuf::from("icons/new.svg"),
+            previous: None,
+            current: b"new current".to_vec(),
+        }];
+
+        let html = render_html(&versions);
+
+        assert!(
+            html.contains(
+                "id=\"mode-switcher\" role=\"group\" aria-label=\"Comparison mode\" hidden"
+            )
+        );
+        assert!(
+            html.contains(
+                "id=\"comparison\" data-mode=\"side-by-side\" data-has-previous=\"false\""
+            )
+        );
+        assert!(html.contains(
+            "data-path=\"icons/new.svg\" data-has-previous=\"false\" data-previous=\"\""
+        ));
+        assert_eq!(
+            html.matches(&format!(
+                "data-current=\"{}\"",
+                STANDARD.encode(b"new current")
+            ))
+            .count(),
+            1
+        );
     }
 
     #[test]
