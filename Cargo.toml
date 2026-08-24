@@ -9,6 +9,9 @@ license = "MIT OR Apache-2.0"
 anyhow = "1.0"
 base64 = "0.22"
 clap = { version = "4.6", features = ["derive"] }
-gix = { version = "0.86", default-features = false, features = ["sha1"] }
+gix = { version = "0.87", default-features = false, features = ["sha1"] }
 open = "5.3"
 tempdir = "0.3"
+
+[patch.crates-io]
+bisync = { git = "https://github.com/JM4ier/bisync.git", rev = "be3a0a6255a0af592e66be8614a149151f67fdf5" }
