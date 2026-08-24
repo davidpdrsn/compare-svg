@@ -627,6 +627,7 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
         document.getElementById("current-image"),
         document.getElementById("current-overlay-image"),
       ];
+      let currentFileIndex = 0;
 
       const clampPercentage = (value) => Math.min(100, Math.max(0, Number(value)));
 
@@ -645,6 +646,7 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
       }};
 
       const setFile = (index) => {{
+        currentFileIndex = index;
         const file = files[index];
         const path = file.dataset.path;
         const hasPrevious = file.dataset.hasPrevious === "true";
@@ -705,11 +707,7 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
         button.addEventListener("click", () => setFile(index));
         button.addEventListener("keydown", (event) => {{
           let nextIndex = null;
-          if (event.key === "ArrowDown") {{
-            nextIndex = Math.min(fileButtons.length - 1, index + 1);
-          }} else if (event.key === "ArrowUp") {{
-            nextIndex = Math.max(0, index - 1);
-          }} else if (event.key === "Home") {{
+          if (event.key === "Home") {{
             nextIndex = 0;
           }} else if (event.key === "End") {{
             nextIndex = fileButtons.length - 1;
@@ -721,6 +719,24 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
             setFile(nextIndex);
           }}
         }});
+      }});
+      document.addEventListener("keydown", (event) => {{
+        if (event.key !== "ArrowDown" && event.key !== "ArrowUp") {{
+          return;
+        }}
+
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const nextIndex = Math.min(
+          fileButtons.length - 1,
+          Math.max(0, currentFileIndex + direction),
+        );
+        const shouldMoveFocus = fileButtons.includes(document.activeElement);
+        setFile(nextIndex);
+        fileButtons[nextIndex].scrollIntoView({{ block: "nearest" }});
+        if (shouldMoveFocus) {{
+          fileButtons[nextIndex].focus();
+        }}
       }});
       onionRange.addEventListener("input", () => updateOnionOpacity(onionRange.value));
       swipeRange.addEventListener("input", () => updateSwipePosition(swipeRange.value));
@@ -871,6 +887,9 @@ mod tests {
         assert!(html.contains(".app-shell[data-sidebar-hidden=\"true\"]"));
         assert!(html.contains("setSidebarVisible(true)"));
         assert!(html.contains("setFile(0)"));
+        assert!(html.contains("document.addEventListener(\"keydown\""));
+        assert!(html.contains("event.key !== \"ArrowDown\" && event.key !== \"ArrowUp\""));
+        assert!(html.contains("fileButtons[nextIndex].scrollIntoView"));
         assert_eq!(
             html.matches(&format!(
                 "data-previous=\"{}\"",
