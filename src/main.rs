@@ -721,12 +721,17 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
         }});
       }});
       document.addEventListener("keydown", (event) => {{
-        if (event.key !== "ArrowDown" && event.key !== "ArrowUp") {{
+        if (
+          event.key !== "ArrowDown" &&
+          event.key !== "ArrowUp" &&
+          event.key !== "j" &&
+          event.key !== "k"
+        ) {{
           return;
         }}
 
         event.preventDefault();
-        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const direction = event.key === "ArrowDown" || event.key === "j" ? 1 : -1;
         const nextIndex = Math.min(
           fileButtons.length - 1,
           Math.max(0, currentFileIndex + direction),
@@ -888,7 +893,11 @@ mod tests {
         assert!(html.contains("setSidebarVisible(true)"));
         assert!(html.contains("setFile(0)"));
         assert!(html.contains("document.addEventListener(\"keydown\""));
-        assert!(html.contains("event.key !== \"ArrowDown\" && event.key !== \"ArrowUp\""));
+        assert!(html.contains("event.key !== \"ArrowDown\""));
+        assert!(html.contains("event.key !== \"ArrowUp\""));
+        assert!(html.contains("event.key !== \"j\""));
+        assert!(html.contains("event.key !== \"k\""));
+        assert!(html.contains("event.key === \"ArrowDown\" || event.key === \"j\" ? 1 : -1"));
         assert!(html.contains("fileButtons[nextIndex].scrollIntoView"));
         assert_eq!(
             html.matches(&format!(
