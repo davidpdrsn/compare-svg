@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt::Write as _,
     fs,
     io::{BufRead as _, BufReader, Read as _, Write as _},
@@ -11,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use axum::{
-    Router,
+    Json, Router,
     extract::{State, WebSocketUpgrade, ws::WebSocket},
     http::{StatusCode, header},
     response::Html,
@@ -19,7 +20,8 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Args, Parser, Subcommand};
-use tokio::{net::TcpListener, sync::watch};
+use serde::{Deserialize, Serialize};
+use tokio::{net::TcpListener, process::Command as TokioCommand, sync::watch};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: u64 = 30;
@@ -65,6 +67,12 @@ struct SnapshotVersions {
     repository_relative_path: PathBuf,
     previous: Option<Vec<u8>>,
     current: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct LoadedComparison {
+    worktree: PathBuf,
+    versions: Vec<SnapshotVersions>,
 }
 
 fn main() -> ExitCode {
@@ -176,22 +184,64 @@ struct ServerState {
     html: Arc<String>,
     activity: watch::Sender<BrowserActivity>,
     shutdown_timeout: Duration,
+    worktree: Arc<PathBuf>,
+    svg_paths: Arc<HashSet<PathBuf>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ButStatus {
+    stacks: Vec<ButStack>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ButStack {
+    branches: Vec<ButBranch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ButBranch {
+    commits: Vec<ButCommit>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ButCommit {
+    cli_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SquashRequest {
+    path: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct SquashResponse {
+    message: String,
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
-    let versions = load_versions(&args.paths)?;
-    let html = Arc::new(render_html(&versions));
+    let loaded = load_versions(&args.paths)?;
+    let html = Arc::new(render_html(&loaded.versions));
+    let svg_paths = loaded
+        .versions
+        .iter()
+        .map(|versions| versions.repository_relative_path.clone())
+        .collect();
     let shutdown_timeout = Duration::from_secs(args.timeout);
     let (activity, activity_updates) = watch::channel(BrowserActivity::default());
     let state = ServerState {
         html,
         activity,
         shutdown_timeout,
+        worktree: Arc::new(loaded.worktree),
+        svg_paths: Arc::new(svg_paths),
     };
     let app = Router::new()
         .route("/", get(serve_comparison))
         .route("/lifecycle.js", get(serve_lifecycle_script))
         .route("/heartbeat", post(record_heartbeat))
+        .route("/squash", post(squash_snapshot))
         .route("/ws", get(upgrade_websocket))
         .with_state(state);
     let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
@@ -258,6 +308,112 @@ async fn record_heartbeat(State(state): State<ServerState>) -> StatusCode {
     });
     tracing::debug!("browser heartbeat received");
     StatusCode::NO_CONTENT
+}
+
+type SquashResult = Result<Json<SquashResponse>, (StatusCode, Json<SquashResponse>)>;
+
+async fn squash_snapshot(
+    State(state): State<ServerState>,
+    Json(request): Json<SquashRequest>,
+) -> SquashResult {
+    if !state.svg_paths.contains(&request.path) {
+        return Err(squash_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "'{}' is not part of this comparison",
+                request.path.display()
+            ),
+        ));
+    }
+
+    let status_output = TokioCommand::new("but")
+        .arg("-C")
+        .arg(state.worktree.as_ref())
+        .args(["status", "--json"])
+        .output()
+        .await
+        .map_err(|error| {
+            squash_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to run but status: {error}"),
+            )
+        })?;
+    if !status_output.status.success() {
+        return Err(command_error("but status", &status_output.stderr));
+    }
+
+    let status: ButStatus = serde_json::from_slice(&status_output.stdout).map_err(|error| {
+        squash_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to parse but status: {error}"),
+        )
+    })?;
+    let target = topmost_commit(&status).ok_or_else(|| {
+        squash_error(
+            StatusCode::CONFLICT,
+            "there are no commits in the workspace to squash into",
+        )
+    })?;
+
+    tracing::info!(
+        path = %request.path.display(),
+        target,
+        "squashing snapshot into commit"
+    );
+    let squash_output = TokioCommand::new("but")
+        .arg("-C")
+        .arg(state.worktree.as_ref())
+        .arg("squash")
+        .arg(&request.path)
+        .args(["-t", target])
+        .output()
+        .await
+        .map_err(|error| {
+            squash_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to run but squash: {error}"),
+            )
+        })?;
+    if !squash_output.status.success() {
+        return Err(command_error("but squash", &squash_output.stderr));
+    }
+
+    tracing::info!(path = %request.path.display(), target, "snapshot squashed");
+    Ok(Json(SquashResponse {
+        message: format!("Squashed into {target}"),
+    }))
+}
+
+fn topmost_commit(status: &ButStatus) -> Option<&str> {
+    status
+        .stacks
+        .iter()
+        .flat_map(|stack| &stack.branches)
+        .find_map(|branch| branch.commits.first())
+        .map(|commit| commit.cli_id.as_str())
+}
+
+fn command_error(command: &str, stderr: &[u8]) -> (StatusCode, Json<SquashResponse>) {
+    let stderr = String::from_utf8_lossy(stderr);
+    let detail = stderr.trim();
+    let message = if detail.is_empty() {
+        format!("{command} failed")
+    } else {
+        format!("{command} failed: {detail}")
+    };
+    squash_error(StatusCode::CONFLICT, message)
+}
+
+fn squash_error(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> (StatusCode, Json<SquashResponse>) {
+    (
+        status,
+        Json(SquashResponse {
+            message: message.into(),
+        }),
+    )
 }
 
 async fn upgrade_websocket(
@@ -340,7 +496,7 @@ async fn shutdown_signal(
     }
 }
 
-fn load_versions(input_paths: &[PathBuf]) -> Result<Vec<SnapshotVersions>> {
+fn load_versions(input_paths: &[PathBuf]) -> Result<LoadedComparison> {
     let current_paths = input_paths
         .iter()
         .map(|input_path| canonicalize_svg(input_path))
@@ -385,7 +541,7 @@ fn load_versions(input_paths: &[PathBuf]) -> Result<Vec<SnapshotVersions>> {
         .context("failed to resolve HEAD to a commit; the repository may not have any commits")?;
     let tree = head.tree().context("failed to load the tree at HEAD")?;
 
-    current_paths
+    let versions = current_paths
         .into_iter()
         .map(|current_path| {
             let repository_relative_path = current_path
@@ -434,7 +590,9 @@ fn load_versions(input_paths: &[PathBuf]) -> Result<Vec<SnapshotVersions>> {
                 current,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(LoadedComparison { worktree, versions })
 }
 
 fn canonicalize_svg(input_path: &Path) -> Result<PathBuf> {
@@ -585,6 +743,8 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
       background: #1f6feb26;
       color: #fff;
     }}
+    .file-button[data-squashed="true"] {{ opacity: 0.45; }}
+    .file-button[data-squashed="true"][aria-current="true"] {{ opacity: 0.7; }}
     .content {{ min-width: 0; }}
     header {{
       padding: 1rem 1.25rem;
@@ -803,6 +963,31 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
       line-height: 1;
     }}
     .comparison[data-mode="onion"] .swipe-handle {{ display: none; }}
+    .toast {{
+      position: fixed;
+      right: 1.25rem;
+      bottom: 1.25rem;
+      z-index: 10;
+      display: flex;
+      max-width: min(24rem, calc(100vw - 2.5rem));
+      align-items: center;
+      gap: 0.625rem;
+      padding: 0.625rem 0.75rem;
+      border: 1px solid #3b414d;
+      border-left: 3px solid #3fb950;
+      border-radius: 0.375rem;
+      background: #252a34;
+      box-shadow: 0 0.375rem 1rem rgb(0 0 0 / 35%);
+      color: #f0f3f6;
+      font-size: 0.875rem;
+      font-weight: 600;
+    }}
+    .toast[data-kind="error"] {{ border-left-color: #f85149; }}
+    .toast[data-kind="error"]::before {{
+      color: #f85149;
+      content: "!";
+    }}
+    .toast[hidden] {{ display: none; }}
     @media (max-width: 48rem) {{
       .app-shell {{ grid-template-columns: minmax(0, 1fr); }}
       .file-sidebar {{
@@ -876,6 +1061,7 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
       </main>
     </div>
   </div>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
   <script src="/lifecycle.js"></script>
   <script>
     (() => {{
@@ -895,6 +1081,7 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
       const overlayTitle = document.getElementById("overlay-title");
       const imageStack = document.getElementById("image-stack");
       const selectedPath = document.getElementById("selected-path");
+      const toast = document.getElementById("toast");
       const fileButtons = Array.from(document.querySelectorAll("[data-file-index]"));
       const files = Array.from(document.querySelectorAll("[data-file]"));
       const viewports = Array.from(document.querySelectorAll(".viewport"));
@@ -907,8 +1094,57 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
         document.getElementById("current-overlay-image"),
       ];
       let currentFileIndex = 0;
+      let squashInProgress = false;
+      let toastTimer = null;
 
       const clampPercentage = (value) => Math.min(100, Math.max(0, Number(value)));
+
+      const showToast = (message, kind) => {{
+        if (toastTimer !== null) {{
+          window.clearTimeout(toastTimer);
+        }}
+        toast.textContent = message;
+        toast.dataset.kind = kind;
+        toast.hidden = false;
+        toastTimer = window.setTimeout(() => {{
+          toast.hidden = true;
+          toastTimer = null;
+        }}, 4_000);
+      }};
+
+      const squashCurrentFile = async () => {{
+        if (squashInProgress) {{
+          return;
+        }}
+
+        squashInProgress = true;
+        const squashedIndex = currentFileIndex;
+        const file = files[squashedIndex];
+        const path = file.dataset.path;
+        const nextIndex = Math.min(files.length - 1, squashedIndex + 1);
+        setFile(nextIndex);
+        fileButtons[nextIndex].focus();
+        fileButtons[nextIndex].scrollIntoView({{ block: "nearest" }});
+
+        try {{
+          const response = await fetch("/squash", {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify({{ path }}),
+          }});
+          const payload = await response.json();
+          if (!response.ok) {{
+            throw new Error(payload.message || "Failed to squash snapshot");
+          }}
+
+          showToast(payload.message, "success");
+          fileButtons[squashedIndex].dataset.squashed = "true";
+        }} catch (error) {{
+          showToast(error instanceof Error ? error.message : String(error), "error");
+        }} finally {{
+          squashInProgress = false;
+        }}
+      }};
 
       const setSidebarVisible = (isVisible) => {{
         appShell.dataset.sidebarHidden = String(!isVisible);
@@ -1000,6 +1236,12 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
         }});
       }});
       document.addEventListener("keydown", (event) => {{
+        if (event.key === "Enter") {{
+          event.preventDefault();
+          void squashCurrentFile();
+          return;
+        }}
+
         if (
           event.key !== "ArrowDown" &&
           event.key !== "ArrowUp" &&
@@ -1198,6 +1440,12 @@ mod tests {
         assert!(html.contains("setFile(0)"));
         assert!(html.contains("<script src=\"/lifecycle.js\"></script>"));
         assert!(!html.contains("connectLifecycleSocket"));
+        assert!(html.contains("id=\"toast\" role=\"status\""));
+        assert!(html.contains("fetch(\"/squash\""));
+        assert!(html.contains("event.key === \"Enter\""));
+        assert!(html.contains("void squashCurrentFile()"));
+        assert!(html.contains("dataset.squashed = \"true\""));
+        assert!(html.contains(".file-button[data-squashed=\"true\"]"));
         assert!(html.contains("document.addEventListener(\"keydown\""));
         assert!(html.contains("event.key !== \"ArrowDown\""));
         assert!(html.contains("event.key !== \"ArrowUp\""));
@@ -1262,6 +1510,32 @@ mod tests {
             .count(),
             1
         );
+    }
+
+    #[test]
+    fn finds_first_commit_after_empty_branches() {
+        let status: ButStatus = serde_json::from_str(
+            r#"{
+                "stacks": [
+                    { "branches": [{ "commits": [] }] },
+                    { "branches": [
+                        { "commits": [{ "cliId": "qpq" }, { "cliId": "ssw" }] }
+                    ] }
+                ]
+            }"#,
+        )
+        .expect("status should parse");
+
+        assert_eq!(topmost_commit(&status), Some("qpq"));
+    }
+
+    #[test]
+    fn returns_no_target_when_status_has_no_commits() {
+        let status: ButStatus =
+            serde_json::from_str(r#"{ "stacks": [{ "branches": [{ "commits": [] }] }] }"#)
+                .expect("status should parse");
+
+        assert_eq!(topmost_commit(&status), None);
     }
 
     #[test]

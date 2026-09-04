@@ -4,6 +4,8 @@ Compare SVG files in a Git working tree with their versions at `HEAD`. The comma
 
 The server remains available while a browser is connected. After the last browser disconnects, it shuts down following a 30-second grace period.
 
+Press Enter while viewing a snapshot to squash that file into the first commit shown by `but status`, then advance to the next snapshot.
+
 ## Examples
 
 Compare one SVG:
