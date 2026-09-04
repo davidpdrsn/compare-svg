@@ -7,11 +7,14 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1.0"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 clap = { version = "4.6", features = ["derive"] }
 gix = { version = "0.87", default-features = false, features = ["sha1"] }
 open = "5.3"
-tempdir = "0.3"
+tokio = { version = "1.47", features = ["net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [patch.crates-io]
 bisync = { git = "https://github.com/JM4ier/bisync.git", rev = "be3a0a6255a0af592e66be8614a149151f67fdf5" }

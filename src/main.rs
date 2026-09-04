@@ -1,24 +1,59 @@
 use std::{
     fmt::Write as _,
     fs,
+    io::{BufRead as _, BufReader, Read as _, Write as _},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{Command, ExitCode, Stdio},
+    sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
+use axum::{
+    Router,
+    extract::{State, WebSocketUpgrade, ws::WebSocket},
+    http::{StatusCode, header},
+    response::Html,
+    routing::{get, post},
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use clap::Parser;
-use tempdir::TempDir;
+use clap::{Args, Parser, Subcommand};
+use tokio::{net::TcpListener, sync::watch};
+use tracing_subscriber::EnvFilter;
+
+const DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: u64 = 30;
 
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Compare SVGs in the working tree with their versions at Git HEAD"
+    about = "Compare SVGs in the working tree with their versions at Git HEAD",
+    subcommand_negates_reqs = true
 )]
 struct Cli {
-    /// Open the generated comparison in the default browser
-    #[arg(long)]
-    open: bool,
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Run as if compare-svg was started in this directory
+    #[arg(short = 'C', global = true, value_name = "PATH")]
+    directory: Option<PathBuf>,
+
+    /// Paths to SVGs in the same Git working tree
+    #[arg(required = true, value_name = "PATH")]
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Run the comparison web server in the foreground
+    Serve(ServeArgs),
+}
+
+#[derive(Debug, Args)]
+struct ServeArgs {
+    /// Seconds to wait without browser activity before shutting down
+    #[arg(long, default_value_t = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS)]
+    timeout: u64,
 
     /// Paths to SVGs in the same Git working tree
     #[arg(required = true, value_name = "PATH")]
@@ -43,22 +78,266 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let versions = load_versions(&cli.paths)?;
-    let html = render_html(&versions);
-    let output_path = write_to_temp_dir(&html)?;
-
-    println!("{}", output_path.display());
-
-    if cli.open {
-        open::that(&output_path).with_context(|| {
+    if let Some(directory) = &cli.directory {
+        std::env::set_current_dir(directory).with_context(|| {
             format!(
-                "failed to open '{}' in the default browser",
-                output_path.display()
+                "failed to change working directory to '{}'",
+                directory.display()
             )
         })?;
     }
 
+    match cli.command {
+        Some(Commands::Serve(args)) => run_server(args),
+        None => launch_background_server(&cli.paths),
+    }
+}
+
+fn launch_background_server(paths: &[PathBuf]) -> Result<()> {
+    let executable =
+        std::env::current_exe().context("failed to find the compare-svg executable")?;
+    let mut child = Command::new(executable)
+        .arg("serve")
+        .arg("--")
+        .args(paths)
+        .env("RUST_LOG", "off")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start the comparison server")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture the comparison server URL")?;
+    let mut reader = BufReader::new(stdout);
+    let mut url = String::new();
+    reader
+        .read_line(&mut url)
+        .context("failed to read the comparison server URL")?;
+    let url = url.trim();
+
+    if url.is_empty() {
+        let status = child
+            .wait()
+            .context("failed to wait for the comparison server")?;
+        let mut stderr = String::new();
+        if let Some(mut child_stderr) = child.stderr.take() {
+            child_stderr
+                .read_to_string(&mut stderr)
+                .context("failed to read the comparison server error")?;
+        }
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!("comparison server exited before starting ({status})");
+        }
+        bail!("comparison server exited before starting ({status}): {stderr}");
+    }
+
+    drop(child.stderr.take());
+    if let Err(error) = open::that(url) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error)
+            .with_context(|| format!("failed to open '{url}' in the default browser"));
+    }
+
     Ok(())
+}
+
+fn run_server(args: ServeArgs) -> Result<()> {
+    init_logging()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to create the async runtime")?;
+
+    runtime.block_on(serve(args))
+}
+
+fn init_logging() -> Result<()> {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("compare_svg=info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("failed to initialize logging: {error}"))
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BrowserActivity {
+    connections: usize,
+    heartbeat: u64,
+}
+
+#[derive(Clone)]
+struct ServerState {
+    html: Arc<String>,
+    activity: watch::Sender<BrowserActivity>,
+    shutdown_timeout: Duration,
+}
+
+async fn serve(args: ServeArgs) -> Result<()> {
+    let versions = load_versions(&args.paths)?;
+    let html = Arc::new(render_html(&versions));
+    let shutdown_timeout = Duration::from_secs(args.timeout);
+    let (activity, activity_updates) = watch::channel(BrowserActivity::default());
+    let state = ServerState {
+        html,
+        activity,
+        shutdown_timeout,
+    };
+    let app = Router::new()
+        .route("/", get(serve_comparison))
+        .route("/lifecycle.js", get(serve_lifecycle_script))
+        .route("/heartbeat", post(record_heartbeat))
+        .route("/ws", get(upgrade_websocket))
+        .with_state(state);
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .context("failed to bind the comparison server")?;
+    let address = listener
+        .local_addr()
+        .context("failed to determine the comparison server address")?;
+    let url = format!("http://{address}/");
+
+    tracing::info!(%url, timeout_seconds = args.timeout, "comparison server started");
+    println!("{url}");
+    std::io::stdout()
+        .flush()
+        .context("failed to print the comparison server URL")?;
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(activity_updates, shutdown_timeout))
+        .await
+        .context("comparison server failed")?;
+    tracing::info!("comparison server stopped");
+
+    Ok(())
+}
+
+async fn serve_comparison(State(state): State<ServerState>) -> Html<String> {
+    Html(state.html.as_ref().clone())
+}
+
+async fn serve_lifecycle_script(
+    State(state): State<ServerState>,
+) -> ([(header::HeaderName, &'static str); 1], String) {
+    let timeout_millis = state.shutdown_timeout.as_millis();
+    let heartbeat_interval_millis = (timeout_millis / 3).clamp(250, 5_000);
+    let script = format!(
+        r#"(() => {{
+  "use strict";
+
+  const heartbeat = () => {{
+    fetch("/heartbeat", {{ method: "POST", cache: "no-store" }}).catch(() => {{}});
+  }};
+  heartbeat();
+  window.setInterval(heartbeat, {heartbeat_interval_millis});
+
+  const connect = () => {{
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(`${{protocol}}//${{window.location.host}}/ws`);
+    socket.addEventListener("close", () => window.setTimeout(connect, 1_000));
+  }};
+  connect();
+}})();
+"#
+    );
+
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        script,
+    )
+}
+
+async fn record_heartbeat(State(state): State<ServerState>) -> StatusCode {
+    state.activity.send_modify(|activity| {
+        activity.heartbeat = activity.heartbeat.wrapping_add(1);
+    });
+    tracing::debug!("browser heartbeat received");
+    StatusCode::NO_CONTENT
+}
+
+async fn upgrade_websocket(
+    websocket: WebSocketUpgrade,
+    State(state): State<ServerState>,
+) -> impl axum::response::IntoResponse {
+    tracing::info!("browser WebSocket upgrade requested");
+    websocket.on_upgrade(move |socket| track_browser_connection(socket, state))
+}
+
+async fn track_browser_connection(mut socket: WebSocket, state: ServerState) {
+    state
+        .activity
+        .send_modify(|activity| activity.connections += 1);
+    tracing::info!(
+        connections = state.activity.borrow().connections,
+        "browser connected"
+    );
+
+    while let Some(message) = socket.recv().await {
+        if let Err(error) = message {
+            tracing::debug!(%error, "browser WebSocket closed with an error");
+            break;
+        }
+    }
+
+    state
+        .activity
+        .send_modify(|activity| activity.connections -= 1);
+    tracing::info!(
+        connections = state.activity.borrow().connections,
+        "browser disconnected"
+    );
+}
+
+async fn shutdown_signal(
+    mut activity_updates: watch::Receiver<BrowserActivity>,
+    timeout: Duration,
+) {
+    loop {
+        if activity_updates.borrow_and_update().connections == 0 {
+            tracing::debug!(
+                timeout_seconds = timeout.as_secs(),
+                "waiting for browser activity"
+            );
+            tokio::select! {
+                () = tokio::time::sleep(timeout) => {
+                    tracing::info!("browser activity timeout elapsed; shutting down");
+                    return;
+                }
+                changed = activity_updates.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                result = tokio::signal::ctrl_c() => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "failed to listen for Ctrl-C");
+                    }
+                    tracing::info!("received Ctrl-C; shutting down");
+                    return;
+                }
+            }
+        } else {
+            tokio::select! {
+                changed = activity_updates.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                result = tokio::signal::ctrl_c() => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "failed to listen for Ctrl-C");
+                    }
+                    tracing::info!("received Ctrl-C; shutting down");
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn load_versions(input_paths: &[PathBuf]) -> Result<Vec<SnapshotVersions>> {
@@ -234,7 +513,6 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
   <title>SVG comparison — {first_path}</title>
   <style>
     :root {{
@@ -598,6 +876,7 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
       </main>
     </div>
   </div>
+  <script src="/lifecycle.js"></script>
   <script>
     (() => {{
       "use strict";
@@ -791,22 +1070,6 @@ fn render_html(versions: &[SnapshotVersions]) -> String {
     )
 }
 
-fn write_to_temp_dir(html: &str) -> Result<PathBuf> {
-    let temp_dir = TempDir::new("compare-svg")
-        .context("failed to create a temporary directory for the comparison")?;
-    let output_path = temp_dir.path().join("comparison.html");
-
-    fs::write(&output_path, html).with_context(|| {
-        format!(
-            "failed to write comparison HTML to '{}'",
-            output_path.display()
-        )
-    })?;
-
-    let persisted_dir = temp_dir.into_path();
-    Ok(persisted_dir.join("comparison.html"))
-}
-
 fn escape_html(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
@@ -828,10 +1091,11 @@ mod tests {
 
     #[test]
     fn parses_multiple_paths() {
-        let cli = Cli::try_parse_from(["compare-svg", "--open", "snapshot.svg", "icons/other.svg"])
+        let cli = Cli::try_parse_from(["compare-svg", "snapshot.svg", "icons/other.svg"])
             .expect("arguments should parse");
 
-        assert!(cli.open);
+        assert!(cli.command.is_none());
+        assert!(cli.directory.is_none());
         assert_eq!(
             cli.paths,
             [
@@ -842,8 +1106,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_working_directory() {
+        let cli = Cli::try_parse_from(["compare-svg", "-C", "/tmp/repository", "snapshot.svg"])
+            .expect("working directory should parse");
+
+        assert_eq!(cli.directory, Some(PathBuf::from("/tmp/repository")));
+        assert_eq!(cli.paths, [PathBuf::from("snapshot.svg")]);
+    }
+
+    #[test]
+    fn parses_working_directory_after_serve_subcommand() {
+        let cli = Cli::try_parse_from([
+            "compare-svg",
+            "serve",
+            "-C",
+            "/tmp/repository",
+            "snapshot.svg",
+        ])
+        .expect("global working directory should parse after the subcommand");
+
+        assert_eq!(cli.directory, Some(PathBuf::from("/tmp/repository")));
+        let Some(Commands::Serve(args)) = cli.command else {
+            panic!("expected the serve command");
+        };
+        assert_eq!(args.paths, [PathBuf::from("snapshot.svg")]);
+    }
+
+    #[test]
+    fn parses_serve_timeout_and_paths() {
+        let cli = Cli::try_parse_from(["compare-svg", "serve", "--timeout", "120", "snapshot.svg"])
+            .expect("serve arguments should parse");
+
+        let Some(Commands::Serve(args)) = cli.command else {
+            panic!("expected the serve command");
+        };
+        assert_eq!(args.timeout, 120);
+        assert_eq!(args.paths, [PathBuf::from("snapshot.svg")]);
+    }
+
+    #[test]
     fn requires_at_least_one_path() {
         assert!(Cli::try_parse_from(["compare-svg"]).is_err());
+        assert!(Cli::try_parse_from(["compare-svg", "serve"]).is_err());
     }
 
     #[test]
@@ -892,6 +1196,8 @@ mod tests {
         assert!(html.contains(".app-shell[data-sidebar-hidden=\"true\"]"));
         assert!(html.contains("setSidebarVisible(true)"));
         assert!(html.contains("setFile(0)"));
+        assert!(html.contains("<script src=\"/lifecycle.js\"></script>"));
+        assert!(!html.contains("connectLifecycleSocket"));
         assert!(html.contains("document.addEventListener(\"keydown\""));
         assert!(html.contains("event.key !== \"ArrowDown\""));
         assert!(html.contains("event.key !== \"ArrowUp\""));
@@ -956,22 +1262,6 @@ mod tests {
             .count(),
             1
         );
-    }
-
-    #[test]
-    fn persists_generated_html() {
-        let output_path = write_to_temp_dir("comparison").expect("HTML should be written");
-        let output_dir = output_path
-            .parent()
-            .expect("output should have a parent")
-            .to_owned();
-
-        assert_eq!(
-            fs::read_to_string(&output_path).expect("HTML should remain readable"),
-            "comparison"
-        );
-
-        fs::remove_dir_all(output_dir).expect("test output should be removable");
     }
 
     #[test]
